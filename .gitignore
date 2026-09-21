@@ -1,20 +1,13 @@
-# ROS 2 Build Artifacts
-build/
-install/
-log/
-
-# Python specific
-**/_pycache_/
+# Python
+__pycache__/
 *.pyc
+.venv/
 
 # Compiled files
 *.so
 *.dll
 *.dylib
 *.o
-
-# CMake generated files
-*.cmake
 
 # IDE/Editor specific
 .vscode/

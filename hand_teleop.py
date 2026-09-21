@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Standalone (non-ROS) test tool: verify webcam finger tracking before wiring it
-to real servos. Shows the MediaPipe hand skeleton plus, for each finger, the
-measured bend angle and the servo value it would produce with the current
-ANGLE_OPEN_DEG/ANGLE_CLOSED_DEG calibration.
+"""Main program: webcam -> MediaPipe -> per-finger calibration/smoothing ->
+serial -> ESP32 -> real servos. Shows the MediaPipe skeleton and each finger's
+live angle/servo value on screen while it drives the actual hardware.
 
-These constants and the angle math mirror hand_teleop.py
-on purpose — if you retune calibration here, copy the same values over there.
+Keep ANGLE_OPEN_DEG / ANGLE_CLOSED_DEG / FINGER_CHANNELS / FINGER_INVERTED /
+SMOOTH_ALPHA in sync with utils/test_webcam_hands.py if you retune any of
+them — see README.md.
 
 Usage:
-    python3 utils/test_webcam_hands.py [--camera 0] [--no-mirror]
+    python3 hand_teleop.py --port /dev/ttyUSB0
+    python3 hand_teleop.py --port /dev/ttyUSB0 --camera 0 --no-mirror
 
 Press 'q' or Esc to quit.
 """
@@ -20,13 +21,9 @@ import math
 
 import cv2
 import mediapipe as mp
+import serial
 
-# ---- Keep these blocks identical to hand_teleop.py ----
-# Per-finger calibration: the raw joint angle range that maps to fully
-# open (1.0) / fully closed (0.0). The thumb's base->knuckle->tip metric has a
-# much narrower natural range than the other fingers (measured ~122-179 deg vs
-# ~5-178 deg for the others), so it needs its own bounds — using the same 40/160
-# range as the other fingers left the thumb unable to ever read as "closed".
+# ---- Keep these blocks identical to utils/test_webcam_hands.py ----
 ANGLE_OPEN_DEG = {
     "thumb": 175.0,
     "index": 160.0,
@@ -40,6 +37,14 @@ ANGLE_CLOSED_DEG = {
     "middle": 40.0,
     "ring": 40.0,
     "pinky": 40.0,
+}
+
+FINGER_CHANNELS = {
+    "thumb": 4,
+    "index": 0,
+    "middle": 1,
+    "ring": 2,
+    "pinky": 3,
 }
 
 FINGER_INVERTED = {
@@ -57,6 +62,8 @@ FINGER_LANDMARKS = {
     "ring": (13, 14, 16),
     "pinky": (17, 18, 20),
 }
+
+SMOOTH_ALPHA = 0.4
 # ------------------------------------------------------------------------------
 
 FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
@@ -69,13 +76,9 @@ FINGER_LABELS_PT = {
     "pinky": "Mindinho",
 }
 
-# Requested capture resolution (actual value depends on what the camera/driver
-# supports in MJPG mode; the negotiated size is printed on startup). 960x540 is
-# the practical ceiling over a usbipd-win passthrough on this setup — 1280x720
-# consistently produced corrupted (black/green) frames, likely from USB/IP not
-# sustaining the extra bandwidth for the isochronous webcam transfer in time.
 CAMERA_WIDTH = 960
 CAMERA_HEIGHT = 540
+SERIAL_BAUDRATE = 115200
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.45
@@ -84,53 +87,51 @@ LINE_HEIGHT = 20
 
 
 def draw_text_with_bg(frame, text, x, y, color):
-    """Draws `text` with its baseline at (x, y), over an opaque black box."""
     (w, h), baseline = cv2.getTextSize(text, FONT, FONT_SCALE, FONT_THICKNESS)
     cv2.rectangle(frame, (x - 3, y - h - 3), (x + w + 3, y + baseline + 3), (0, 0, 0), cv2.FILLED)
     cv2.putText(frame, text, (x, y), FONT, FONT_SCALE, color, FONT_THICKNESS, cv2.LINE_AA)
 
 
 def joint_angle_deg(a, b, c) -> float:
-    """Angle at point b between segments b->a and b->c, in degrees."""
     v1 = (a.x - b.x, a.y - b.y, a.z - b.z)
     v2 = (c.x - b.x, c.y - b.y, c.z - b.z)
     n1 = math.sqrt(sum(p * p for p in v1))
     n2 = math.sqrt(sum(p * p for p in v2))
     if n1 < 1e-9 or n2 < 1e-9:
-        return 180.0  # degenerate vectors: treat as straight/open
+        return 180.0
     cos_a = sum(p * q for p, q in zip(v1, v2)) / (n1 * n2)
     cos_a = max(-1.0, min(1.0, cos_a))
     return math.degrees(math.acos(cos_a))
 
 
 def angle_to_t(angle_deg: float, name: str) -> float:
-    """Normalizes a raw joint angle to 1.0 (open) .. 0.0 (closed) using that
-    finger's own calibration — independent of servo wiring direction."""
     lo, hi = ANGLE_CLOSED_DEG[name], ANGLE_OPEN_DEG[name]
     t = (angle_deg - lo) / (hi - lo)
     return max(0.0, min(1.0, t))
 
 
 def t_to_servo(t: float, inverted: bool) -> int:
-    servo = (1.0 - t) * 180.0  # 0 = open, 180 = closed
+    servo = (1.0 - t) * 180.0
     if inverted:
         servo = 180.0 - servo
     return int(round(servo))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test webcam finger tracking.")
+    parser = argparse.ArgumentParser(description="Webcam-to-ESP32 hand teleoperation.")
+    parser.add_argument("--port", required=True, help="ESP32 serial port, e.g. /dev/ttyUSB0.")
     parser.add_argument("--camera", type=int, default=0, help="Webcam device index.")
     parser.add_argument("--no-mirror", action="store_true", help="Disable selfie-view mirroring.")
     args = parser.parse_args()
 
+    esp32 = serial.Serial(args.port, SERIAL_BAUDRATE, timeout=0)
+    print(f"ESP32 conectada em {args.port}.")
+
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"Não foi possível abrir a câmera {args.camera}")
+        esp32.close()
         return
-    # Força MJPG: YUYV bruto costuma chegar corrompido (bloco verde) sob
-    # usbipd-win, já que USB/IP não lida bem com transferências isócronas
-    # de alta banda. MJPG usa bem menos banda e evita o problema.
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
@@ -145,11 +146,9 @@ def main():
         min_tracking_confidence=0.6,
     )
 
-    angle_min = {name: math.inf for name in FINGER_ORDER}
-    angle_max = {name: -math.inf for name in FINGER_ORDER}
+    last_servo = {name: 0 for name in FINGER_ORDER}
 
     print("Pressione 'q' ou Esc para sair.")
-    print("Abra e feche a mao (e o polegar sozinho) para mapear a faixa de cada dedo.")
     try:
         while True:
             ok, frame = cap.read()
@@ -172,37 +171,36 @@ def main():
                 for name in FINGER_ORDER:
                     base_i, mid_i, tip_i = FINGER_LANDMARKS[name]
                     angle = joint_angle_deg(landmarks[base_i], landmarks[mid_i], landmarks[tip_i])
-                    angle_min[name] = min(angle_min[name], angle)
-                    angle_max[name] = max(angle_max[name], angle)
-
                     t = angle_to_t(angle, name)
-                    servo = t_to_servo(t, FINGER_INVERTED[name])
+                    target = t_to_servo(t, FINGER_INVERTED[name])
+                    last_servo[name] = int(round(
+                        (1.0 - SMOOTH_ALPHA) * last_servo[name] + SMOOTH_ALPHA * target
+                    ))
+
                     state = "ABERTO" if t >= 0.5 else "FECHADO"
                     label = FINGER_LABELS_PT[name]
-                    text = f"{label:10s} ang={angle:5.1f} servo={servo:3d} {state}"
+                    text = f"{label:10s} ang={angle:5.1f} servo={last_servo[name]:3d} {state}"
                     draw_text_with_bg(frame, text, 10, y, (0, 255, 0))
                     y += LINE_HEIGHT
+
+                line = ",".join(f"{name}={last_servo[name]}" for name in FINGER_ORDER)
+                try:
+                    esp32.write((line + "\n").encode())
+                    esp32.reset_input_buffer()
+                except Exception as e:
+                    draw_text_with_bg(frame, f"Erro serial: {e}", 10, y, (0, 0, 255))
             else:
                 draw_text_with_bg(frame, "Nenhuma mao detectada", 10, y, (0, 0, 255))
 
-            cv2.imshow("Hand tracking test", frame)
+            cv2.imshow("Teleoperacao da mao (webcam -> ESP32)", frame)
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), 27):  # q or Esc
+            if key in (ord('q'), 27):
                 break
     finally:
         cap.release()
         hands.close()
         cv2.destroyAllWindows()
-
-        print("\nFaixa de angulo bruto observada nesta sessao (graus):")
-        print(f"{'dedo':10s} {'min':>7s} {'max':>7s} {'calib.fechado':>14s} {'calib.aberto':>13s}")
-        for name in FINGER_ORDER:
-            lo, hi = angle_min[name], angle_max[name]
-            if lo == math.inf:
-                print(f"{FINGER_LABELS_PT[name]:10s} sem dados (mao nao detectada)")
-            else:
-                print(f"{FINGER_LABELS_PT[name]:10s} {lo:7.1f} {hi:7.1f} "
-                      f"{ANGLE_CLOSED_DEG[name]:14.0f} {ANGLE_OPEN_DEG[name]:13.0f}")
+        esp32.close()
 
 
 if __name__ == "__main__":
